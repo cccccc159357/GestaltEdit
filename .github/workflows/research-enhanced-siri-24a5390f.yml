@@ -26,53 +26,53 @@ jobs:
           runtime_root=""
           if command -v python3 >/dev/null 2>&1; then
             runtime_root="$(python3 - "$RUNNER_TEMP/runtimes.json" <<'PY'
-import json, os, sys
-path = sys.argv[1]
-try:
-    with open(path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-except Exception as e:
-    print(f'parse-error: {e}', file=sys.stderr)
-    sys.exit(0)
-for r in data.get('runtimes', []):
-    if (r.get('identifier') == 'com.apple.CoreSimulator.SimRuntime.iOS-27-0'
-            and r.get('buildversion') == '24A5390f'
-            and r.get('isAvailable')):
-        root = r.get('runtimeRoot')
-        if not root:
-            b = r.get('bundlePath')
-            if b:
-                root = os.path.join(b, 'Contents', 'Resources', 'RuntimeRoot')
-        if root and os.path.isdir(root):
-            print(root)
-            sys.exit(0)
-sys.exit(0)
-PY
-)"
+          import json, os, sys
+          path = sys.argv[1]
+          try:
+              with open(path, 'r', encoding='utf-8') as f:
+                  data = json.load(f)
+          except Exception as e:
+              print(f'parse-error: {e}', file=sys.stderr)
+              sys.exit(0)
+          for r in data.get('runtimes', []):
+              if (r.get('identifier') == 'com.apple.CoreSimulator.SimRuntime.iOS-27-0'
+                      and r.get('buildversion') == '24A5390f'
+                      and r.get('isAvailable')):
+                  root = r.get('runtimeRoot')
+                  if not root:
+                      b = r.get('bundlePath')
+                      if b:
+                          root = os.path.join(b, 'Contents', 'Resources', 'RuntimeRoot')
+                  if root and os.path.isdir(root):
+                      print(root)
+                      sys.exit(0)
+          sys.exit(0)
+          PY
+          )"
           fi
           if [ -z "$runtime_root" ]; then
             echo "Falling back to simctl runtime list -j"
             if command -v python3 >/dev/null 2>&1; then
               runtime_root="$(python3 - "$RUNNER_TEMP/runtime-list.json" <<'PY'
-import json, os, sys
-path = sys.argv[1]
-try:
-    with open(path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-except Exception:
-    sys.exit(0)
-for r in data.values():
-    if (r.get('runtimeIdentifier') == 'com.apple.CoreSimulator.SimRuntime.iOS-27-0'
-            and r.get('build') == '24A5390f'):
-        b = r.get('runtimeBundlePath')
-        if b:
-            root = os.path.join(b, 'Contents', 'Resources', 'RuntimeRoot')
-            if os.path.isdir(root):
-                print(root)
-                sys.exit(0)
-sys.exit(0)
-PY
-)"
+          import json, os, sys
+          path = sys.argv[1]
+          try:
+              with open(path, 'r', encoding='utf-8') as f:
+                  data = json.load(f)
+          except Exception:
+              sys.exit(0)
+          for r in data.values():
+              if (r.get('runtimeIdentifier') == 'com.apple.CoreSimulator.SimRuntime.iOS-27-0'
+                      and r.get('build') == '24A5390f'):
+                  b = r.get('runtimeBundlePath')
+                  if b:
+                      root = os.path.join(b, 'Contents', 'Resources', 'RuntimeRoot')
+                      if os.path.isdir(root):
+                          print(root)
+                          sys.exit(0)
+          sys.exit(0)
+          PY
+          )"
             fi
           fi
           if [ -z "$runtime_root" ]; then
