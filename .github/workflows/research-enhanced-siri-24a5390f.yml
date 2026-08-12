@@ -1,0 +1,173 @@
+name: Research Enhanced Siri Reason 24A5390f
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  analyze:
+    # xcode-27 image ships the iOS 27.0 simulator runtime built from 24A5390f,
+    # so we can analyze exact-build system frameworks without downloading the
+    # ~12 GB restore IPSW first.
+    runs-on: xcode-27
+    timeout-minutes: 180
+
+    steps:
+      - name: Locate iOS 27.0 simulator runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun simctl list runtimes 2>/dev/null || true
+          runtime_root=""
+          while IFS= read -r runtime; do
+            root="$runtime/Contents/Resources/RuntimeRoot"
+            if [ -d "$root" ]; then
+              runtime_root="$root"
+            fi
+          done < <(find /Library/Developer/CoreSimulator/Profiles/Runtimes \
+            -maxdepth 1 -iname "*.simruntime" -print)
+          if [ -z "$runtime_root" ]; then
+            echo "::error::No simulator runtime root found."
+            exit 1
+          fi
+          echo "RUNTIME_ROOT=$runtime_root" >> "$GITHUB_ENV"
+          echo "Using runtime root: $runtime_root"
+
+      - name: Sparse clone exact-build ipsw-diffs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/research"
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/blacktop/ipsw-diffs.git \
+            "$RUNNER_TEMP/research/ipsw-diffs"
+          cd "$RUNNER_TEMP/research/ipsw-diffs"
+          git sparse-checkout set \
+            27_0_24A5380h_vs_27_0_24A5390f \
+            27_0_24A5390f_vs_27_0_24A5408d \
+            26_5_23F77_vs_27_0_24A5355q
+
+      - name: Grep exact-build ipsw-diffs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/analysis"
+          cd "$RUNNER_TEMP/research/ipsw-diffs"
+          grep -RInE \
+            "com\.apple\.gms\.enhancedSiri|pendingEnrollment|forcedWaitlistStatus|SOLinwoodAvailability|AFSiriUnavailability|SiriModePolicy|DeviceSiriMode|HasLinwood|enhancedSiri\.reasons|linwoodAvailability" \
+            --include="*.md" . \
+            > "$RUNNER_TEMP/analysis/ipsw-diffs-hits.txt" || true
+          wc -l "$RUNNER_TEMP/analysis/ipsw-diffs-hits.txt"
+
+      - name: Collect exact-build simulator binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/analysis/binaries.txt"
+          : > "$RUNNER_TEMP/analysis/missing.txt"
+          bin_rels=(
+            "System/Library/PrivateFrameworks/GenerativeModels.framework/GenerativeModels"
+            "System/Library/PrivateFrameworks/GenerativeExperiencesRuntime.framework/GenerativeExperiencesRuntime"
+            "System/Library/PrivateFrameworks/AssistantServices.framework/AssistantServices"
+            "System/Library/PrivateFrameworks/SiriAvailability.framework/SiriAvailability"
+            "usr/libexec/eligibilityd"
+            "System/Library/PrivateFrameworks/AssistantServices.framework/assistantd"
+          )
+          for rel in "${bin_rels[@]}"; do
+            bin="$RUNTIME_ROOT/$rel"
+            if [ -f "$bin" ]; then
+              echo "$bin" >> "$RUNNER_TEMP/analysis/binaries.txt"
+            else
+              echo "$rel" >> "$RUNNER_TEMP/analysis/missing.txt"
+            fi
+          done
+          echo "Found binaries:"
+          cat "$RUNNER_TEMP/analysis/binaries.txt"
+          echo "Missing binaries:"
+          cat "$RUNNER_TEMP/analysis/missing.txt"
+
+      - name: Analyze binaries with strings, nm, otool, swift-demangle
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r bin; do
+            name="$(basename "$bin")"
+            strings -a "$bin" | grep -iE \
+              "enhancedSiri|pendingEnrollment|forcedWaitlistStatus|SOLinwood|AFSiriUnavailability|SiriMode|HasLinwood|linwoodAvailability|reasons|GMS" \
+              > "$RUNNER_TEMP/analysis/strings-$name.txt" || true
+            nm -arch arm64 "$bin" 2>/dev/null | swift-demangle 2>/dev/null | grep -iE \
+              "EnhancedSiri|Linwood|Reason|Availability|DeviceSiriMode|HasLinwood|SiriMode|GMS" \
+              > "$RUNNER_TEMP/analysis/symbols-$name.txt" || true
+            nm -arch arm64 "$bin" 2>/dev/null | awk \
+              '$3 ~ /Reason|EnhancedSiri|Linwood|Availability|SiriMode|HasLinwood/ {print $3}' \
+              | head -80 > "$RUNNER_TEMP/analysis/funcs-$name.txt" || true
+            otool -ov "$bin" 2>/dev/null | grep -iE \
+              "SiriMode|Linwood|Reason|Availability|HasLinwood|enhancedSiri" \
+              > "$RUNNER_TEMP/analysis/objc-$name.txt" || true
+            while IFS= read -r sym; do
+              otool -tvV -p "$sym" "$bin" \
+                >> "$RUNNER_TEMP/analysis/disasm-$name.txt" 2>/dev/null || true
+            done < "$RUNNER_TEMP/analysis/funcs-$name.txt"
+          done < "$RUNNER_TEMP/analysis/binaries.txt"
+          ls -lh "$RUNNER_TEMP/analysis"
+
+      - name: Install ipsw and run Mach-O targeted searches
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install blacktop/tap/ipsw >/tmp/ipsw-install.log 2>&1 || \
+            brew install ipsw >/tmp/ipsw-install.log 2>&1 || true
+          if command -v ipsw >/dev/null 2>&1; then
+            ipsw version
+            while IFS= read -r bin; do
+              name="$(basename "$bin")"
+              ipsw macho info "$bin" \
+                > "$RUNNER_TEMP/analysis/ipsw-info-$name.txt" 2>&1 || true
+              ipsw macho search "$bin" --string "com.apple.gms.enhancedSiri.reasons" \
+                > "$RUNNER_TEMP/analysis/ipsw-search-reasons-$name.txt" 2>&1 || true
+              ipsw macho search "$bin" --string "pendingEnrollment" \
+                > "$RUNNER_TEMP/analysis/ipsw-search-pending-$name.txt" 2>&1 || true
+            done < "$RUNNER_TEMP/analysis/binaries.txt"
+          else
+            echo "ipsw not installed; using strings/nm/otool evidence only." \
+              > "$RUNNER_TEMP/analysis/ipsw-unavailable.txt"
+          fi
+
+      - name: Build report and upload artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/analysis/REPORT.md"
+          {
+            echo "# Enhanced Siri reason research: 24A5390f"
+            echo ""
+            echo "## Environment"
+            echo "- Build: 24A5390f"
+            echo "- Runtime root: $RUNTIME_ROOT"
+            echo ""
+            echo "## Missing binaries"
+            cat "$RUNNER_TEMP/analysis/missing.txt" 2>/dev/null || true
+            echo ""
+            echo "## Binaries analyzed"
+            cat "$RUNNER_TEMP/analysis/binaries.txt" 2>/dev/null || true
+            echo ""
+            echo "## ipsw-diffs hits"
+            wc -l "$RUNNER_TEMP/analysis/ipsw-diffs-hits.txt" 2>/dev/null || true
+            echo ""
+            echo "## Key strings"
+            head -200 "$RUNNER_TEMP/analysis"/strings-* 2>/dev/null || true
+            echo ""
+            echo "## Key symbols"
+            head -200 "$RUNNER_TEMP/analysis"/symbols-* 2>/dev/null || true
+          } > "$report"
+          echo "Report written to $report"
+
+      - name: Upload research artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-enhanced-siri-24A5390f
+          path: ${{ runner.temp }}/analysis
+          if-no-files-found: error
