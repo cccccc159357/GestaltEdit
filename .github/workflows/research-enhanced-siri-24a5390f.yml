@@ -250,6 +250,39 @@ jobs:
               fi
             done < "$RUNNER_TEMP/analysis/missing.bak"
           fi
+          if command -v ipsw >/dev/null 2>&1 && [ -s "$RUNNER_TEMP/analysis/missing.txt" ]; then
+            cp "$RUNNER_TEMP/analysis/missing.txt" "$RUNNER_TEMP/analysis/missing.bak"
+            echo "--- remote extracting dyld cache from exact 24A5390f IPSW ---"
+            mkdir -p "$RUNNER_TEMP/dyld"
+            ipsw extract --remote --dyld --dyld-arch arm64e \
+              "$ipsw_url" -o "$RUNNER_TEMP/dyld" \
+              >> "$RUNNER_TEMP/analysis/extract.log" 2>&1 || true
+            cache="$(find "$RUNNER_TEMP/dyld" -type f -name 'dyld_shared_cache*' | head -1)"
+            echo "dyld cache: $cache" >> "$RUNNER_TEMP/analysis/extract.log"
+            if [ -n "$cache" ]; then
+              while IFS= read -r rel; do
+                name="$(basename "$rel")"
+                mkdir -p "$RUNNER_TEMP/extracted/$name"
+                (
+                  cd "$RUNNER_TEMP/extracted/$name"
+                  ipsw dyld extract "$cache" --dylib "$name" -o "$RUNNER_TEMP/extracted/$name" \
+                    >> "$RUNNER_TEMP/analysis/extract.log" 2>&1 || true
+                )
+              done < "$RUNNER_TEMP/analysis/missing.bak"
+            fi
+            find "$RUNNER_TEMP/extracted" -type f -size +100k \
+              -exec sh -c 'file "$1"' _ {} \; >> "$RUNNER_TEMP/analysis/extract.log" || true
+            : > "$RUNNER_TEMP/analysis/missing.txt"
+            while IFS= read -r rel; do
+              name="$(basename "$rel")"
+              found="$(find "$RUNNER_TEMP/extracted" -type f -name "$name" | head -1)"
+              if [ -n "$found" ]; then
+                echo "$found" >> "$RUNNER_TEMP/analysis/binaries.txt"
+              else
+                echo "$rel" >> "$RUNNER_TEMP/analysis/missing.txt"
+              fi
+            done < "$RUNNER_TEMP/analysis/missing.bak"
+          fi
           echo "--- extraction log ---"
           cat "$RUNNER_TEMP/analysis/extract.log" || true
           cp "$RUNNER_TEMP/runtimes.json" "$RUNNER_TEMP/analysis/runtimes.json" 2>/dev/null || true
@@ -277,13 +310,13 @@ jobs:
             strings -a -t x "$bin" | grep -iE \
               "enhancedSiri\.reasons|Unknown Enhanced Siri reason|device is still on waitlist|pendingEnrollment|essentialAssetReadiness|com\.apple\.gms\.enhancedSiri" \
               > "$RUNNER_TEMP/analysis/string-offsets-$name.txt" || true
-            nm -arch arm64 "$bin" 2>/dev/null | $demangler 2>/dev/null \
+            nm "$bin" 2>/dev/null | $demangler 2>/dev/null \
               > "$RUNNER_TEMP/analysis/demangled-$name.txt" || true
             grep -iE \
               "UnifiedReason|UnavailableReason|RestrictedReason|pendingEnrollment|essentialAssetReadiness|EnhancedSiri|Linwood|HasLinwood|SiriMode|Reason|Availability" \
               "$RUNNER_TEMP/analysis/demangled-$name.txt" \
               > "$RUNNER_TEMP/analysis/symbols-$name.txt" || true
-            nm -arch arm64 "$bin" 2>/dev/null | awk \
+            nm "$bin" 2>/dev/null | awk \
               '$3 ~ /Reason|EnhancedSiri|Linwood|Availability|SiriMode|HasLinwood|GMS/ {print $3}' \
               | head -120 > "$RUNNER_TEMP/analysis/funcs-$name.txt" || true
             otool -ov "$bin" 2>/dev/null | grep -iE \
@@ -296,16 +329,16 @@ jobs:
                 ipsw macho disass "$bin" --symbol "$sym" \
                   >> "$RUNNER_TEMP/analysis/disasm-$name.txt" 2>&1 || true
               done < "$RUNNER_TEMP/analysis/funcs-$name.txt"
-              ipsw macho search "$bin" --string "com.apple.gms.enhancedSiri.reasons" \
+              ipsw macho search "$bin" --sym "UnifiedReason|UnavailableReason|pendingEnrollment|essentialAssetReadiness" \
                 > "$RUNNER_TEMP/analysis/ipsw-search-reasons-$name.txt" 2>&1 || true
-              ipsw macho search "$bin" --string "Unknown Enhanced Siri reason code" \
+              ipsw macho search "$bin" --sym "HasLinwood|SiriMode|LinwoodAvailability" \
                 > "$RUNNER_TEMP/analysis/ipsw-search-unknownreason-$name.txt" 2>&1 || true
-              ipsw macho search "$bin" --string "device is still on waitlist" \
+              ipsw macho search "$bin" --sym "EnhancedSiri|Linwood" \
                 > "$RUNNER_TEMP/analysis/ipsw-search-waitlist-$name.txt" 2>&1 || true
             else
               while IFS= read -r sym; do
                 for cand in "$sym" "${sym#_}"; do
-                  if otool -tvV -arch arm64 -p "$cand" "$bin" \
+                  if otool -tvV -p "$cand" "$bin" \
                       >> "$RUNNER_TEMP/analysis/disasm-$name.txt" 2>/dev/null; then
                     break
                   fi
