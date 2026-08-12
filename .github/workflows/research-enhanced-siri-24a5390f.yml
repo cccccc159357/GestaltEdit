@@ -9,41 +9,91 @@ permissions:
 
 jobs:
   analyze:
-    # xcode-27 image ships the iOS 27.0 simulator runtime built from 24A5390f,
-    # so we can analyze exact-build system frameworks without downloading the
-    # ~12 GB restore IPSW first.
     runs-on: xcode-27
     timeout-minutes: 180
 
     steps:
-      - name: Locate iOS 27.0 simulator runtime
+      - name: Locate exact iOS 27.0 (24A5390f) simulator runtime
         shell: bash
         run: |
           set -euo pipefail
-          xcrun simctl list runtimes 2>/dev/null || true
-          echo "--- simctl list runtimes JSON ---"
-          xcrun simctl list runtimes -j 2>/dev/null || true
-          echo "--- simctl runtime list JSON ---"
-          xcrun simctl runtime list -j 2>/dev/null || true
-          echo "--- find simruntime bundles ---"
-          find /Applications /Library/Developer "$HOME/Library/Developer" \
-            -iname "*.simruntime" -print 2>/dev/null | head -50 || true
-          echo "--- find paths containing CoreSimulator ---"
-          find / -maxdepth 8 -path "*CoreSimulator*" -iname "*iOS*27*" \
-            -print 2>/dev/null | head -50 || true
+          xcrun simctl list runtimes
+          echo "--- runtime list JSON ---"
+          xcrun simctl runtime list -j > "$RUNNER_TEMP/runtime-list.json" 2>/dev/null || true
+          xcrun simctl list runtimes -j > "$RUNNER_TEMP/runtimes.json" 2>/dev/null || true
+          head -c 1200 "$RUNNER_TEMP/runtimes.json" 2>/dev/null || true
+          echo ""
           runtime_root=""
-          while IFS= read -r runtime; do
-            root="$runtime/Contents/Resources/RuntimeRoot"
-            if [ -d "$root" ]; then
-              runtime_root="$root"
-            fi
-          done < <(find /Applications /Library/Developer "$HOME/Library/Developer" \
-            -iname "*.simruntime" -print 2>/dev/null)
-          if [ -z "$runtime_root" ]; then
-            echo "::warning::No simulator runtime root found; continuing with ipsw-diffs only."
+          if command -v python3 >/dev/null 2>&1; then
+            runtime_root="$(python3 - "$RUNNER_TEMP/runtimes.json" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+try:
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+except Exception as e:
+    print(f'parse-error: {e}', file=sys.stderr)
+    sys.exit(0)
+for r in data.get('runtimes', []):
+    if (r.get('identifier') == 'com.apple.CoreSimulator.SimRuntime.iOS-27-0'
+            and r.get('buildversion') == '24A5390f'
+            and r.get('isAvailable')):
+        root = r.get('runtimeRoot')
+        if not root:
+            b = r.get('bundlePath')
+            if b:
+                root = os.path.join(b, 'Contents', 'Resources', 'RuntimeRoot')
+        if root and os.path.isdir(root):
+            print(root)
+            sys.exit(0)
+sys.exit(0)
+PY
+)"
           fi
-          echo "RUNTIME_ROOT=$runtime_root" >> "$GITHUB_ENV"
-          echo "Using runtime root: $runtime_root"
+          if [ -z "$runtime_root" ]; then
+            echo "Falling back to simctl runtime list -j"
+            if command -v python3 >/dev/null 2>&1; then
+              runtime_root="$(python3 - "$RUNNER_TEMP/runtime-list.json" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+try:
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+for r in data.values():
+    if (r.get('runtimeIdentifier') == 'com.apple.CoreSimulator.SimRuntime.iOS-27-0'
+            and r.get('build') == '24A5390f'):
+        b = r.get('runtimeBundlePath')
+        if b:
+            root = os.path.join(b, 'Contents', 'Resources', 'RuntimeRoot')
+            if os.path.isdir(root):
+                print(root)
+                sys.exit(0)
+sys.exit(0)
+PY
+)"
+            fi
+          fi
+          if [ -z "$runtime_root" ]; then
+            echo "Falling back to filesystem search"
+            while IFS= read -r sim; do
+              root="$sim/Contents/Resources/RuntimeRoot"
+              if [ -d "$root" ] && [ -f "$root/System/Library/PrivateFrameworks/GenerativeModels.framework/GenerativeModels" ]; then
+                runtime_root="$root"
+                break
+              fi
+            done < <(find /Library/Developer /private/var/run /System/Library/AssetsV2 -iname "*.simruntime" -print 2>/dev/null || true)
+          fi
+          if [ -n "$runtime_root" ]; then
+            echo "RUNTIME_ROOT=$runtime_root" >> "$GITHUB_ENV"
+            echo "Using exact iOS 27.0 (24A5390f) runtime root: $runtime_root"
+            echo "SystemVersion.plist:"
+            plutil -p "$runtime_root/System/Library/CoreServices/SystemVersion.plist" 2>/dev/null | head -30 || true
+          else
+            echo "::warning::Exact iOS simulator runtime not found; continuing with ipsw-diffs only."
+            echo "RUNTIME_ROOT=" >> "$GITHUB_ENV"
+          fi
 
       - name: Sparse clone exact-build ipsw-diffs
         shell: bash
@@ -66,7 +116,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/analysis"
           cd "$RUNNER_TEMP/research/ipsw-diffs"
           grep -RInE \
-            "com\.apple\.gms\.enhancedSiri|pendingEnrollment|forcedWaitlistStatus|SOLinwoodAvailability|AFSiriUnavailability|SiriModePolicy|DeviceSiriMode|HasLinwood|enhancedSiri\.reasons|linwoodAvailability" \
+            "com\.apple\.gms\.enhancedSiri|pendingEnrollment|forcedWaitlistStatus|SOLinwoodAvailability|AFSiriUnavailability|SiriModePolicy|DeviceSiriMode|HasLinwood|enhancedSiri\.reasons|linwoodAvailability|UnifiedReason|UnavailableReason|RestrictedReason|essentialAssetReadiness|Enhanced Siri returning|Unknown Enhanced Siri reason" \
             --include="*.md" . \
             > "$RUNNER_TEMP/analysis/ipsw-diffs-hits.txt" || true
           wc -l "$RUNNER_TEMP/analysis/ipsw-diffs-hits.txt"
@@ -91,6 +141,8 @@ jobs:
             "System/Library/PrivateFrameworks/GenerativeExperiencesRuntime.framework/GenerativeExperiencesRuntime"
             "System/Library/PrivateFrameworks/AssistantServices.framework/AssistantServices"
             "System/Library/PrivateFrameworks/SiriAvailability.framework/SiriAvailability"
+            "System/Library/PrivateFrameworks/SiriActivationFoundation.framework/SiriActivationFoundation"
+            "System/Library/PrivateFrameworks/SiriSetup.framework/SiriSetup"
             "usr/libexec/eligibilityd"
             "System/Library/PrivateFrameworks/AssistantServices.framework/assistantd"
           )
@@ -106,6 +158,8 @@ jobs:
           cat "$RUNNER_TEMP/analysis/binaries.txt"
           echo "Missing binaries:"
           cat "$RUNNER_TEMP/analysis/missing.txt"
+          cp "$RUNNER_TEMP/runtimes.json" "$RUNNER_TEMP/analysis/runtimes.json" 2>/dev/null || true
+          cp "$RUNNER_TEMP/runtime-list.json" "$RUNNER_TEMP/analysis/runtime-list.json" 2>/dev/null || true
 
       - name: Analyze binaries with strings, nm, otool, swift-demangle
         shell: bash
@@ -121,8 +175,14 @@ jobs:
             strings -a "$bin" | grep -iE \
               "enhancedSiri|pendingEnrollment|forcedWaitlistStatus|SOLinwood|AFSiriUnavailability|SiriMode|HasLinwood|linwoodAvailability|reasons|GMS" \
               > "$RUNNER_TEMP/analysis/strings-$name.txt" || true
-            nm -arch arm64 "$bin" 2>/dev/null | swift-demangle 2>/dev/null | grep -iE \
-              "EnhancedSiri|Linwood|Reason|Availability|DeviceSiriMode|HasLinwood|SiriMode|GMS" \
+            strings -a -t x "$bin" | grep -iE \
+              "enhancedSiri\.reasons|Unknown Enhanced Siri reason|device is still on waitlist|pendingEnrollment|essentialAssetReadiness|com\.apple\.gms\.enhancedSiri" \
+              > "$RUNNER_TEMP/analysis/string-offsets-$name.txt" || true
+            nm -arch arm64 "$bin" 2>/dev/null | swift-demangle 2>/dev/null \
+              > "$RUNNER_TEMP/analysis/demangled-$name.txt" || true
+            grep -iE \
+              "UnifiedReason|UnavailableReason|RestrictedReason|pendingEnrollment|essentialAssetReadiness|EnhancedSiri|Linwood|HasLinwood|SiriMode|Reason|Availability" \
+              "$RUNNER_TEMP/analysis/demangled-$name.txt" \
               > "$RUNNER_TEMP/analysis/symbols-$name.txt" || true
             nm -arch arm64 "$bin" 2>/dev/null | awk \
               '$3 ~ /Reason|EnhancedSiri|Linwood|Availability|SiriMode|HasLinwood/ {print $3}' \
@@ -131,8 +191,12 @@ jobs:
               "SiriMode|Linwood|Reason|Availability|HasLinwood|enhancedSiri" \
               > "$RUNNER_TEMP/analysis/objc-$name.txt" || true
             while IFS= read -r sym; do
-              otool -tvV -p "$sym" "$bin" \
-                >> "$RUNNER_TEMP/analysis/disasm-$name.txt" 2>/dev/null || true
+              for cand in "$sym" "${sym#_}"; do
+                if otool -tvV -arch arm64 -p "$cand" "$bin" \
+                    >> "$RUNNER_TEMP/analysis/disasm-$name.txt" 2>/dev/null; then
+                  break
+                fi
+              done || true
             done < "$RUNNER_TEMP/analysis/funcs-$name.txt"
           done < "$RUNNER_TEMP/analysis/binaries.txt"
           ls -lh "$RUNNER_TEMP/analysis"
@@ -147,17 +211,26 @@ jobs:
             exit 0
           fi
           brew install blacktop/tap/ipsw >/tmp/ipsw-install.log 2>&1 || \
-            brew install ipsw >/tmp/ipsw-install.log 2>&1 || true
+            brew install ipsw >>/tmp/ipsw-install.log 2>&1 || true
           if command -v ipsw >/dev/null 2>&1; then
-            ipsw version
+            ipsw version > "$RUNNER_TEMP/analysis/ipsw-version.txt" 2>&1 || true
             while IFS= read -r bin; do
               name="$(basename "$bin")"
               ipsw macho info "$bin" \
                 > "$RUNNER_TEMP/analysis/ipsw-info-$name.txt" 2>&1 || true
               ipsw macho search "$bin" --string "com.apple.gms.enhancedSiri.reasons" \
                 > "$RUNNER_TEMP/analysis/ipsw-search-reasons-$name.txt" 2>&1 || true
-              ipsw macho search "$bin" --string "pendingEnrollment" \
-                > "$RUNNER_TEMP/analysis/ipsw-search-pending-$name.txt" 2>&1 || true
+              ipsw macho search "$bin" --string "Unknown Enhanced Siri reason code" \
+                > "$RUNNER_TEMP/analysis/ipsw-search-unknownreason-$name.txt" 2>&1 || true
+              ipsw macho search "$bin" --string "device is still on waitlist" \
+                > "$RUNNER_TEMP/analysis/ipsw-search-waitlist-$name.txt" 2>&1 || true
+              nm -arch arm64 "$bin" 2>/dev/null | awk '{print $3}' \
+                | grep -E 'UnifiedReason|UnavailableReason|RestrictedReason|pendingEnrollment|essentialAssetReadiness|EnhancedSiri|HasLinwood|SiriMode' \
+                | head -30 | while IFS= read -r sym; do
+                  echo "===== $sym =====" >> "$RUNNER_TEMP/analysis/ipsw-disasm-$name.txt"
+                  ipsw macho disass "$bin" --symbol "$sym" \
+                    >> "$RUNNER_TEMP/analysis/ipsw-disasm-$name.txt" 2>&1 || true
+                done
             done < "$RUNNER_TEMP/analysis/binaries.txt"
           else
             echo "ipsw not installed; using strings/nm/otool evidence only." \
@@ -184,12 +257,22 @@ jobs:
             echo ""
             echo "## ipsw-diffs hits"
             wc -l "$RUNNER_TEMP/analysis/ipsw-diffs-hits.txt" 2>/dev/null || true
+            head -100 "$RUNNER_TEMP/analysis/ipsw-diffs-hits.txt" 2>/dev/null || true
             echo ""
             echo "## Key strings"
-            head -200 "$RUNNER_TEMP/analysis"/strings-* 2>/dev/null || true
+            head -250 "$RUNNER_TEMP/analysis"/strings-* 2>/dev/null || true
+            echo ""
+            echo "## String offsets"
+            head -100 "$RUNNER_TEMP/analysis"/string-offsets-* 2>/dev/null || true
             echo ""
             echo "## Key symbols"
-            head -200 "$RUNNER_TEMP/analysis"/symbols-* 2>/dev/null || true
+            head -250 "$RUNNER_TEMP/analysis"/symbols-* 2>/dev/null || true
+            echo ""
+            echo "## ipsw searches"
+            head -200 "$RUNNER_TEMP/analysis"/ipsw-search-* 2>/dev/null || true
+            echo ""
+            echo "## ipsw disassembly"
+            head -400 "$RUNNER_TEMP/analysis"/ipsw-disasm-* 2>/dev/null || true
           } > "$report"
           echo "Report written to $report"
 
