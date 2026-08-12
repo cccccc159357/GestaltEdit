@@ -23,6 +23,41 @@ struct EligibilityAPIResponse {
     let rawDictionary: [String: Any]
 }
 
+struct LinwoodFlagResult: Identifiable {
+    let name: String
+    let available: Bool
+    let value: Bool?
+    let error: String?
+
+    var id: String { name }
+}
+
+struct EnrollmentPreferenceEntry: Identifiable {
+    let domain: String
+    let key: String
+    let present: Bool
+    let value: Any?
+
+    var id: String { "\(domain)/\(key)" }
+    var valueDescription: String {
+        guard present, let value else { return "未设置" }
+        return EligibilityPlistText.xml(value)
+    }
+}
+
+struct SiriEnrollmentDiagnostic {
+    let assistantLoaded: Bool
+    let assistantLoadError: String?
+    let linwoodFlags: [LinwoodFlagResult]
+    let preferences: [EnrollmentPreferenceEntry]
+
+    var containsPendingEnrollmentMarker: Bool {
+        preferences.contains {
+            $0.present && $0.valueDescription.contains("pendingEnrollment")
+        }
+    }
+}
+
 struct EligibilityStatusRow: Identifiable {
     let key: String
     let value: Int64
@@ -47,6 +82,7 @@ struct EligibilityDomainResult: Identifiable {
 struct SiriEligibilitySnapshot {
     let capability: EligibilityAPISummary
     let allAnswers: EligibilityAPIResponse
+    let enrollment: SiriEnrollmentDiagnostic
     let allDomains: [EligibilityDomainResult]
     let siriMode: EligibilityDomainResult?
     let relatedDomains: [EligibilityDomainResult]
@@ -121,6 +157,10 @@ enum SiriEligibilityDiagnostics {
         let allResponse = parseAllAnswers(
             EligibilityQueryAllAnswers() as? [String: Any] ?? [:]
         )
+        let enrollment = parseEnrollment(
+            assistant: EnrollmentAssistantAvailability() as? [String: Any] ?? [:],
+            preferences: EnrollmentPreferencesSnapshot() as? [String: Any] ?? [:]
+        )
         let allDomains = allDomains(from: allResponse.rawDictionary)
         let relatedDomains = relatedDomainKeys.map(domainDetail)
         let siriMode = relatedDomains.first {
@@ -132,6 +172,7 @@ enum SiriEligibilityDiagnostics {
         return SiriEligibilitySnapshot(
             capability: capability,
             allAnswers: allResponse,
+            enrollment: enrollment,
             allDomains: allDomains,
             siriMode: siriMode,
             relatedDomains: relatedDomains,
@@ -154,6 +195,34 @@ enum SiriEligibilityDiagnostics {
             errnoValue: (dictionary["errno"] as? NSNumber)?.intValue ?? -1,
             error: dictionary["error"] as? String,
             rawDictionary: dictionary["raw"] as? [String: Any] ?? [:]
+        )
+    }
+
+    private static func parseEnrollment(
+        assistant: [String: Any],
+        preferences: [String: Any]
+    ) -> SiriEnrollmentDiagnostic {
+        let flags = (assistant["flags"] as? [[String: Any]] ?? []).compactMap { flag in
+            LinwoodFlagResult(
+                name: flag["name"] as? String ?? "",
+                available: (flag["available"] as? NSNumber)?.boolValue ?? false,
+                value: (flag["value"] as? NSNumber)?.boolValue,
+                error: flag["error"] as? String
+            )
+        }
+        let entries = (preferences["entries"] as? [[String: Any]] ?? []).compactMap { entry in
+            EnrollmentPreferenceEntry(
+                domain: entry["domain"] as? String ?? "",
+                key: entry["key"] as? String ?? "",
+                present: (entry["present"] as? NSNumber)?.boolValue ?? false,
+                value: entry["value"]
+            )
+        }
+        return SiriEnrollmentDiagnostic(
+            assistantLoaded: (assistant["loaded"] as? NSNumber)?.boolValue ?? false,
+            assistantLoadError: assistant["loadError"] as? String,
+            linwoodFlags: flags,
+            preferences: entries
         )
     }
 

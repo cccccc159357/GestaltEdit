@@ -10,6 +10,7 @@ struct SiriEligibilityView: View {
                 if let snapshot {
                     List {
                         apiCapabilitySection(snapshot)
+                        enrollmentSection(snapshot)
                         siriModeSection(snapshot)
                         relatedDomainsSection(snapshot)
                         allAnswersSection(snapshot)
@@ -76,6 +77,52 @@ struct SiriEligibilityView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
+            }
+        }
+    }
+
+    private func enrollmentSection(_ snapshot: SiriEligibilitySnapshot) -> some View {
+        Section("Siri AI Enrollment") {
+            LabeledContent("AssistantServices") {
+                Text(snapshot.enrollment.assistantLoaded ? "可读取" : "不可用")
+                    .foregroundStyle(snapshot.enrollment.assistantLoaded ? .green : .red)
+            }
+            if let error = snapshot.enrollment.assistantLoadError, !error.isEmpty {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            }
+
+            LabeledContent("waitlist 标记") {
+                Text(snapshot.enrollment.containsPendingEnrollmentMarker
+                     ? "包含 pendingEnrollment"
+                     : "未发现 pendingEnrollment")
+                    .foregroundStyle(snapshot.enrollment.containsPendingEnrollmentMarker
+                                     ? .orange : .secondary)
+            }
+
+            DisclosureGroup("Linwood 只读 Flags") {
+                ForEach(snapshot.enrollment.linwoodFlags) { flag in
+                    LabeledContent(flag.name) {
+                        Text(flagText(flag))
+                            .font(.caption2.monospaced())
+                    }
+                }
+            }
+
+            DisclosureGroup("GenerativeModels Preferences") {
+                ForEach(snapshot.enrollment.preferences) { preference in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(preference.key)
+                            .font(.caption2.monospaced())
+                            .textSelection(.enabled)
+                        Text(preference.valueDescription)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
             }
         }
     }
@@ -151,6 +198,12 @@ struct SiriEligibilityView: View {
                 Label("显示 get_all_domain_answers 原始结果", systemImage: "doc.text.magnifyingglass")
             }
         }
+    }
+
+    private func flagText(_ flag: LinwoodFlagResult) -> String {
+        if !flag.available { return flag.error ?? "symbol 不可用" }
+        if let value = flag.value { return value ? "true" : "false" }
+        return "未读取"
     }
 }
 
