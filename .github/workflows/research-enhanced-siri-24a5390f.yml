@@ -21,6 +21,16 @@ jobs:
         run: |
           set -euo pipefail
           xcrun simctl list runtimes 2>/dev/null || true
+          echo "--- simctl list runtimes JSON ---"
+          xcrun simctl list runtimes -j 2>/dev/null || true
+          echo "--- simctl runtime list JSON ---"
+          xcrun simctl runtime list -j 2>/dev/null || true
+          echo "--- find simruntime bundles ---"
+          find /Applications /Library/Developer "$HOME/Library/Developer" \
+            -iname "*.simruntime" -print 2>/dev/null | head -50 || true
+          echo "--- find paths containing CoreSimulator ---"
+          find / -maxdepth 8 -path "*CoreSimulator*" -iname "*iOS*27*" \
+            -print 2>/dev/null | head -50 || true
           runtime_root=""
           while IFS= read -r runtime; do
             root="$runtime/Contents/Resources/RuntimeRoot"
@@ -28,10 +38,9 @@ jobs:
               runtime_root="$root"
             fi
           done < <(find /Applications /Library/Developer "$HOME/Library/Developer" \
-            -iname "iOS 27.0.simruntime" -print 2>/dev/null)
+            -iname "*.simruntime" -print 2>/dev/null)
           if [ -z "$runtime_root" ]; then
-            echo "::error::No simulator runtime root found."
-            exit 1
+            echo "::warning::No simulator runtime root found; continuing with ipsw-diffs only."
           fi
           echo "RUNTIME_ROOT=$runtime_root" >> "$GITHUB_ENV"
           echo "Using runtime root: $runtime_root"
@@ -68,6 +77,15 @@ jobs:
           set -euo pipefail
           : > "$RUNNER_TEMP/analysis/binaries.txt"
           : > "$RUNNER_TEMP/analysis/missing.txt"
+          if [ -z "$RUNTIME_ROOT" ]; then
+            echo "No simulator runtime root; no simulator binaries available." \
+              > "$RUNNER_TEMP/analysis/missing.txt"
+            echo "Found binaries:"
+            cat "$RUNNER_TEMP/analysis/binaries.txt"
+            echo "Missing:"
+            cat "$RUNNER_TEMP/analysis/missing.txt"
+            exit 0
+          fi
           bin_rels=(
             "System/Library/PrivateFrameworks/GenerativeModels.framework/GenerativeModels"
             "System/Library/PrivateFrameworks/GenerativeExperiencesRuntime.framework/GenerativeExperiencesRuntime"
@@ -93,6 +111,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [ ! -s "$RUNNER_TEMP/analysis/binaries.txt" ]; then
+            echo "No simulator binaries to analyze." \
+              > "$RUNNER_TEMP/analysis/no-binaries.txt"
+            exit 0
+          fi
           while IFS= read -r bin; do
             name="$(basename "$bin")"
             strings -a "$bin" | grep -iE \
@@ -118,6 +141,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [ ! -s "$RUNNER_TEMP/analysis/binaries.txt" ]; then
+            echo "No simulator binaries to analyze with ipsw." \
+              > "$RUNNER_TEMP/analysis/ipsw-unavailable.txt"
+            exit 0
+          fi
           brew install blacktop/tap/ipsw >/tmp/ipsw-install.log 2>&1 || \
             brew install ipsw >/tmp/ipsw-install.log 2>&1 || true
           if command -v ipsw >/dev/null 2>&1; then
