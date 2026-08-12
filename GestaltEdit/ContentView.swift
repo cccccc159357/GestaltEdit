@@ -17,6 +17,9 @@ struct ContentView: View {
 
                     BackupLibrary()
                         .tabItem { Label("Backups", systemImage: "archivebox") }
+
+                    SiriEligibilityView()
+                        .tabItem { Label("Siri AI", systemImage: "checkmark.shield") }
                 }
                 .task { viewModel.load() }
             } else {

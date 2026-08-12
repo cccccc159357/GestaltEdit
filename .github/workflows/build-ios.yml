@@ -1,0 +1,142 @@
+name: Build GestaltEdit (Siri AI Eligibility Read-Only)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-gestaltedit-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # GitHub-hosted macOS 26 + Xcode 27 image. The xcode-27 label is documented
+    # by actions/runner-images issue #14404 and ships Xcode 27.0 beta with the
+    # iphoneos27.0 SDK, matching the iOS 27 beta 4 project.
+    runs-on: xcode-27
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode with iOS 27 SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          selected=""
+          while IFS= read -r candidate; do
+            if [ -d "$candidate/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iphoneos27.0.sdk" ]; then
+              selected="$candidate"
+              break
+            fi
+          done < <(ls -d /Applications/Xcode*.app 2>/dev/null || true)
+
+          if [ -z "$selected" ]; then
+            echo "::error::No Xcode with iphoneos27.0 SDK found on this runner."
+            echo "Installed Xcode versions:"
+            ls -d /Applications/Xcode*.app 2>/dev/null || true
+            exit 1
+          fi
+
+          sudo xcode-select -s "$selected"
+          echo "Selected Xcode: $selected"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Detect project, workspace, and scheme
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Prefer a top-level workspace; ignore the workspace nested inside an
+          # .xcodeproj, which is just Xcode's own project.xcworkspace.
+          workspace="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -name "*.xcworkspace" \
+            ! -path "*/.xcodeproj/*" -print -quit || true)"
+          project="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -name "*.xcodeproj" \
+            -print -quit || true)"
+
+          if [ -n "$workspace" ]; then
+            locator="-workspace $workspace"
+            list_output="$(xcodebuild -list -json -workspace "$workspace")"
+            echo "Detected workspace: $workspace"
+          elif [ -n "$project" ]; then
+            locator="-project $project"
+            list_output="$(xcodebuild -list -json -project "$project")"
+            echo "Detected project: $project"
+          else
+            echo "::error::No .xcodeproj or .xcworkspace found."
+            exit 1
+          fi
+
+          scheme="$(printf '%s' "$list_output" | python3 -c \
+            'import json,sys; d=json.load(sys.stdin); print((d.get("schemes") or [""])[0])')"
+          if [ -z "$scheme" ]; then
+            echo "::error::xcodebuild did not report a scheme."
+            printf '%s\n' "$list_output"
+            exit 1
+          fi
+
+          echo "SCHEME=$scheme" >> "$GITHUB_ENV"
+          echo "LOCATOR=$locator" >> "$GITHUB_ENV"
+          echo "Detected scheme: $scheme"
+
+      - name: Build with xcodebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            $LOCATOR \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$RUNNER_TEMP/derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package app and unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="$(find "$RUNNER_TEMP/derived/Build/Products" -maxdepth 2 \
+            -name "*.app" -print -quit)"
+          if [ -z "$app_path" ]; then
+            echo "::error::xcodebuild succeeded but no .app was found in Products."
+            find "$RUNNER_TEMP/derived/Build/Products" -maxdepth 3 -print
+            exit 1
+          fi
+
+          mkdir -p dist/Payload
+          cp -R "$app_path" dist/Payload/
+          (cd dist && zip -qry GestaltEdit-iOS27Beta4-unsigned.ipa Payload)
+
+          echo "APP_PATH=$app_path" >> "$GITHUB_ENV"
+          echo "Packaged:"
+          ls -lh dist/GestaltEdit-iOS27Beta4-unsigned.ipa
+
+      - name: Upload unsigned build
+        uses: actions/upload-artifact@v4
+        with:
+          name: GestaltEdit-iOS27Beta4-unsigned
+          path: dist
+          if-no-files-found: error
+
+      - name: Write build summary
+        shell: bash
+        run: |
+          {
+            echo "## GestaltEdit iOS 27 Beta 4 unsigned build"
+            echo ""
+            echo "- Xcode: $(xcodebuild -version | head -1)"
+            echo "- Scheme: $SCHEME"
+            echo "- App: $APP_PATH"
+            echo "- Artifact: GestaltEdit-iOS27Beta4-unsigned"
+            echo "- Signing: disabled (CODE_SIGNING_ALLOWED=NO)"
+          } >> "$GITHUB_STEP_SUMMARY"
