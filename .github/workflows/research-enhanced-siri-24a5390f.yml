@@ -10,7 +10,7 @@ permissions:
 jobs:
   analyze:
     runs-on: xcode-27
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Locate exact iOS 27.0 (24A5390f) simulator runtime
@@ -121,12 +121,54 @@ jobs:
             > "$RUNNER_TEMP/analysis/ipsw-diffs-hits.txt" || true
           wc -l "$RUNNER_TEMP/analysis/ipsw-diffs-hits.txt"
 
-      - name: Collect exact-build simulator binaries
+      - name: Install ipsw
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/analysis" "$RUNNER_TEMP/bin" "$RUNNER_TEMP/extracted"
+          if command -v brew >/dev/null 2>&1; then
+            brew install blacktop/tap/ipsw >/tmp/ipsw-install.log 2>&1 || \
+              brew install ipsw >>/tmp/ipsw-install.log 2>&1 || true
+          fi
+          if command -v ipsw >/dev/null 2>&1; then
+            ipsw version > "$RUNNER_TEMP/analysis/ipsw-version.txt" 2>&1 || true
+            echo "ipsw=$(command -v ipsw)"
+            exit 0
+          fi
+          echo "Brew install failed, downloading release binary"
+          curl -fsSL https://api.github.com/repos/blacktop/ipsw/releases/latest \
+            -o "$RUNNER_TEMP/ipsw-release.json"
+          asset="$(python3 - "$RUNNER_TEMP/ipsw-release.json" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          for a in d['assets']:
+              if a['name'].endswith('macOS_arm64.tar.gz'):
+                  print(a['name'])
+                  sys.exit(0)
+          sys.exit(1)
+          PY
+          )"
+          curl -fL "https://github.com/blacktop/ipsw/releases/latest/download/$asset" \
+            -o "$RUNNER_TEMP/ipsw.tar.gz"
+          tar -xzf "$RUNNER_TEMP/ipsw.tar.gz" -C "$RUNNER_TEMP/bin" || true
+          find "$RUNNER_TEMP/bin" -type f -name ipsw -exec chmod +x {} \; 2>/dev/null || true
+          ipsw_path="$(find "$RUNNER_TEMP/bin" -type f -name ipsw | head -1)"
+          if [ -z "$ipsw_path" ]; then
+            echo "ipsw not installed; using strings/nm/otool evidence only." \
+              > "$RUNNER_TEMP/analysis/ipsw-unavailable.txt"
+            exit 0
+          fi
+          ipsw_dir="$(dirname "$ipsw_path")"
+          echo "PATH=$ipsw_dir:$PATH" >> "$GITHUB_ENV"
+          echo "Installed ipsw at $ipsw_path"
+
+      - name: Collect exact-build simulator binaries and extract missing dylibs
         shell: bash
         run: |
           set -euo pipefail
           : > "$RUNNER_TEMP/analysis/binaries.txt"
           : > "$RUNNER_TEMP/analysis/missing.txt"
+          : > "$RUNNER_TEMP/analysis/extract.log"
           if [ -z "$RUNTIME_ROOT" ]; then
             echo "No simulator runtime root; no simulator binaries available." \
               > "$RUNNER_TEMP/analysis/missing.txt"
@@ -158,10 +200,41 @@ jobs:
           cat "$RUNNER_TEMP/analysis/binaries.txt"
           echo "Missing binaries:"
           cat "$RUNNER_TEMP/analysis/missing.txt"
+          echo "--- framework dir listing for missing paths ---"
+          for rel in $(cat "$RUNNER_TEMP/analysis/missing.txt"); do
+            dir="$(dirname "$RUNTIME_ROOT/$rel")"
+            if [ -d "$dir" ]; then
+              ls -la "$dir" >> "$RUNNER_TEMP/analysis/extract.log" || true
+            fi
+          done
+          echo "--- dyld caches in runtime root ---"
+          find "$RUNTIME_ROOT" -name "dyld_shared_cache*" -print \
+            > "$RUNNER_TEMP/analysis/dyld-caches.txt" 2>/dev/null || true
+          cat "$RUNNER_TEMP/analysis/dyld-caches.txt" || true
+          if command -v ipsw >/dev/null 2>&1 && [ -s "$RUNNER_TEMP/analysis/dyld-caches.txt" ] && [ -s "$RUNNER_TEMP/analysis/missing.txt" ]; then
+            cache="$(head -1 "$RUNNER_TEMP/analysis/dyld-caches.txt")"
+            echo "--- extracting missing dylibs from $cache ---"
+            while IFS= read -r rel; do
+              name="$(basename "$rel")"
+              mkdir -p "$RUNNER_TEMP/extracted/$name"
+              (
+                cd "$RUNNER_TEMP/extracted/$name"
+                ipsw dyld extract "$cache" --dylib "$name" >> "$RUNNER_TEMP/analysis/extract.log" 2>&1 || \
+                ipsw dyld extract "$cache" --dylib "/System/Library/PrivateFrameworks/$(dirname "$rel" | sed 's|System/Library/PrivateFrameworks/||')/$name" \
+                  >> "$RUNNER_TEMP/analysis/extract.log" 2>&1 || true
+              )
+            done < "$RUNNER_TEMP/analysis/missing.txt"
+            find "$RUNNER_TEMP/extracted" -type f \( -perm -111 -o -name "GenerativeModels" -o -name "AssistantServices" -o -name "SiriAvailability" -o -name "SiriActivationFoundation" \) \
+              -print >> "$RUNNER_TEMP/analysis/extract.log" || true
+            find "$RUNNER_TEMP/extracted" -type f -size +100k \
+              -exec sh -c 'file "$1"' _ {} \; >> "$RUNNER_TEMP/analysis/extract.log" || true
+          fi
+          echo "--- extraction log ---"
+          cat "$RUNNER_TEMP/analysis/extract.log" || true
           cp "$RUNNER_TEMP/runtimes.json" "$RUNNER_TEMP/analysis/runtimes.json" 2>/dev/null || true
           cp "$RUNNER_TEMP/runtime-list.json" "$RUNNER_TEMP/analysis/runtime-list.json" 2>/dev/null || true
 
-      - name: Analyze binaries with strings, nm, otool, swift-demangle
+      - name: Analyze binaries with strings, nm, otool, swift-demangle, ipsw
         shell: bash
         run: |
           set -euo pipefail
@@ -170,6 +243,11 @@ jobs:
               > "$RUNNER_TEMP/analysis/no-binaries.txt"
             exit 0
           fi
+          demangler="swift-demangle"
+          if command -v xcrun >/dev/null 2>&1 && xcrun --find swift-demangle >/dev/null 2>&1; then
+            demangler="xcrun swift-demangle"
+          fi
+          echo "demangler=$demangler"
           while IFS= read -r bin; do
             name="$(basename "$bin")"
             strings -a "$bin" | grep -iE \
@@ -178,64 +256,43 @@ jobs:
             strings -a -t x "$bin" | grep -iE \
               "enhancedSiri\.reasons|Unknown Enhanced Siri reason|device is still on waitlist|pendingEnrollment|essentialAssetReadiness|com\.apple\.gms\.enhancedSiri" \
               > "$RUNNER_TEMP/analysis/string-offsets-$name.txt" || true
-            nm -arch arm64 "$bin" 2>/dev/null | swift-demangle 2>/dev/null \
+            nm -arch arm64 "$bin" 2>/dev/null | $demangler 2>/dev/null \
               > "$RUNNER_TEMP/analysis/demangled-$name.txt" || true
             grep -iE \
               "UnifiedReason|UnavailableReason|RestrictedReason|pendingEnrollment|essentialAssetReadiness|EnhancedSiri|Linwood|HasLinwood|SiriMode|Reason|Availability" \
               "$RUNNER_TEMP/analysis/demangled-$name.txt" \
               > "$RUNNER_TEMP/analysis/symbols-$name.txt" || true
             nm -arch arm64 "$bin" 2>/dev/null | awk \
-              '$3 ~ /Reason|EnhancedSiri|Linwood|Availability|SiriMode|HasLinwood/ {print $3}' \
-              | head -80 > "$RUNNER_TEMP/analysis/funcs-$name.txt" || true
+              '$3 ~ /Reason|EnhancedSiri|Linwood|Availability|SiriMode|HasLinwood|GMS/ {print $3}' \
+              | head -120 > "$RUNNER_TEMP/analysis/funcs-$name.txt" || true
             otool -ov "$bin" 2>/dev/null | grep -iE \
               "SiriMode|Linwood|Reason|Availability|HasLinwood|enhancedSiri" \
               > "$RUNNER_TEMP/analysis/objc-$name.txt" || true
-            while IFS= read -r sym; do
-              for cand in "$sym" "${sym#_}"; do
-                if otool -tvV -arch arm64 -p "$cand" "$bin" \
-                    >> "$RUNNER_TEMP/analysis/disasm-$name.txt" 2>/dev/null; then
-                  break
-                fi
-              done || true
-            done < "$RUNNER_TEMP/analysis/funcs-$name.txt"
-          done < "$RUNNER_TEMP/analysis/binaries.txt"
-          ls -lh "$RUNNER_TEMP/analysis"
-
-      - name: Install ipsw and run Mach-O targeted searches
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ ! -s "$RUNNER_TEMP/analysis/binaries.txt" ]; then
-            echo "No simulator binaries to analyze with ipsw." \
-              > "$RUNNER_TEMP/analysis/ipsw-unavailable.txt"
-            exit 0
-          fi
-          brew install blacktop/tap/ipsw >/tmp/ipsw-install.log 2>&1 || \
-            brew install ipsw >>/tmp/ipsw-install.log 2>&1 || true
-          if command -v ipsw >/dev/null 2>&1; then
-            ipsw version > "$RUNNER_TEMP/analysis/ipsw-version.txt" 2>&1 || true
-            while IFS= read -r bin; do
-              name="$(basename "$bin")"
-              ipsw macho info "$bin" \
-                > "$RUNNER_TEMP/analysis/ipsw-info-$name.txt" 2>&1 || true
+            : > "$RUNNER_TEMP/analysis/disasm-$name.txt"
+            if command -v ipsw >/dev/null 2>&1; then
+              while IFS= read -r sym; do
+                echo "===== $sym =====" >> "$RUNNER_TEMP/analysis/disasm-$name.txt"
+                ipsw macho disass "$bin" --symbol "$sym" \
+                  >> "$RUNNER_TEMP/analysis/disasm-$name.txt" 2>&1 || true
+              done < "$RUNNER_TEMP/analysis/funcs-$name.txt"
               ipsw macho search "$bin" --string "com.apple.gms.enhancedSiri.reasons" \
                 > "$RUNNER_TEMP/analysis/ipsw-search-reasons-$name.txt" 2>&1 || true
               ipsw macho search "$bin" --string "Unknown Enhanced Siri reason code" \
                 > "$RUNNER_TEMP/analysis/ipsw-search-unknownreason-$name.txt" 2>&1 || true
               ipsw macho search "$bin" --string "device is still on waitlist" \
                 > "$RUNNER_TEMP/analysis/ipsw-search-waitlist-$name.txt" 2>&1 || true
-              nm -arch arm64 "$bin" 2>/dev/null | awk '{print $3}' \
-                | grep -E 'UnifiedReason|UnavailableReason|RestrictedReason|pendingEnrollment|essentialAssetReadiness|EnhancedSiri|HasLinwood|SiriMode' \
-                | head -30 | while IFS= read -r sym; do
-                  echo "===== $sym =====" >> "$RUNNER_TEMP/analysis/ipsw-disasm-$name.txt"
-                  ipsw macho disass "$bin" --symbol "$sym" \
-                    >> "$RUNNER_TEMP/analysis/ipsw-disasm-$name.txt" 2>&1 || true
-                done
-            done < "$RUNNER_TEMP/analysis/binaries.txt"
-          else
-            echo "ipsw not installed; using strings/nm/otool evidence only." \
-              > "$RUNNER_TEMP/analysis/ipsw-unavailable.txt"
-          fi
+            else
+              while IFS= read -r sym; do
+                for cand in "$sym" "${sym#_}"; do
+                  if otool -tvV -arch arm64 -p "$cand" "$bin" \
+                      >> "$RUNNER_TEMP/analysis/disasm-$name.txt" 2>/dev/null; then
+                    break
+                  fi
+                done || true
+              done < "$RUNNER_TEMP/analysis/funcs-$name.txt"
+            fi
+          done < "$RUNNER_TEMP/analysis/binaries.txt"
+          ls -lh "$RUNNER_TEMP/analysis"
 
       - name: Build report and upload artifact
         shell: bash
@@ -255,6 +312,12 @@ jobs:
             echo "## Binaries analyzed"
             cat "$RUNNER_TEMP/analysis/binaries.txt" 2>/dev/null || true
             echo ""
+            echo "## dyld caches"
+            cat "$RUNNER_TEMP/analysis/dyld-caches.txt" 2>/dev/null || true
+            echo ""
+            echo "## Extraction log"
+            cat "$RUNNER_TEMP/analysis/extract.log" 2>/dev/null || true
+            echo ""
             echo "## ipsw-diffs hits"
             wc -l "$RUNNER_TEMP/analysis/ipsw-diffs-hits.txt" 2>/dev/null || true
             head -100 "$RUNNER_TEMP/analysis/ipsw-diffs-hits.txt" 2>/dev/null || true
@@ -271,8 +334,11 @@ jobs:
             echo "## ipsw searches"
             head -200 "$RUNNER_TEMP/analysis"/ipsw-search-* 2>/dev/null || true
             echo ""
-            echo "## ipsw disassembly"
-            head -400 "$RUNNER_TEMP/analysis"/ipsw-disasm-* 2>/dev/null || true
+            echo "## Disassembly"
+            head -500 "$RUNNER_TEMP/analysis"/disasm-* 2>/dev/null || true
+            echo ""
+            echo "## ipsw version"
+            cat "$RUNNER_TEMP/analysis/ipsw-version.txt" 2>/dev/null || true
           } > "$report"
           echo "Report written to $report"
 
