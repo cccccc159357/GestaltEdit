@@ -263,11 +263,14 @@ jobs:
             fi
             echo "dyld cache: $cache" >> "$RUNNER_TEMP/analysis/extract.log"
             if [ -n "$cache" ]; then
+              echo "$cache" > "$RUNNER_TEMP/analysis/dyld-cache.txt"
               while IFS= read -r rel; do
                 name="$(basename "$rel")"
                 mkdir -p "$RUNNER_TEMP/extracted/$name"
                 (
                   cd "$RUNNER_TEMP/extracted/$name"
+                  ipsw dyld extract "$cache" "/$rel" -o "$RUNNER_TEMP/extracted/$name" \
+                    >> "$RUNNER_TEMP/analysis/extract.log" 2>&1 || \
                   ipsw dyld extract "$cache" "$name" -o "$RUNNER_TEMP/extracted/$name" \
                     >> "$RUNNER_TEMP/analysis/extract.log" 2>&1 || true
                 )
@@ -290,6 +293,26 @@ jobs:
           cat "$RUNNER_TEMP/analysis/extract.log" || true
           cp "$RUNNER_TEMP/runtimes.json" "$RUNNER_TEMP/analysis/runtimes.json" 2>/dev/null || true
           cp "$RUNNER_TEMP/runtime-list.json" "$RUNNER_TEMP/analysis/runtime-list.json" 2>/dev/null || true
+
+      - name: Dump in-cache Swift metadata for 24A5390f dylibs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -s "$RUNNER_TEMP/analysis/dyld-cache.txt" ] || [ ! -s "$RUNNER_TEMP/analysis/missing.bak" ]; then
+            echo "No dyld cache or missing list to analyze." \
+              > "$RUNNER_TEMP/analysis/dyld-macho-skip.txt"
+            exit 0
+          fi
+          cache="$(cat "$RUNNER_TEMP/analysis/dyld-cache.txt")"
+          while IFS= read -r rel; do
+            name="$(basename "$rel")"
+            ipsw dyld macho "$cache" "/$rel" --demangle --swift --symbols --strings \
+              > "$RUNNER_TEMP/analysis/dyld-macho-$name.txt" 2>&1 || \
+            ipsw dyld macho "$cache" "$name" --demangle --swift --symbols --strings \
+              > "$RUNNER_TEMP/analysis/dyld-macho-$name.txt" 2>&1 || true
+            echo "===== $rel =====" >> "$RUNNER_TEMP/analysis/dyld-macho-$name.txt"
+          done < "$RUNNER_TEMP/analysis/missing.bak"
+          ls -lh "$RUNNER_TEMP/analysis"/dyld-macho-* 2>/dev/null || true
 
       - name: Analyze binaries with strings, nm, otool, swift-demangle, ipsw
         shell: bash
@@ -386,6 +409,9 @@ jobs:
             echo ""
             echo "## ipsw info"
             head -100 "$RUNNER_TEMP/analysis"/ipsw-info-* 2>/dev/null || true
+            echo ""
+            echo "## dyld macho Swift metadata"
+            head -400 "$RUNNER_TEMP/analysis"/dyld-macho-* 2>/dev/null || true
             echo ""
             echo "## Disassembly"
             head -500 "$RUNNER_TEMP/analysis"/disasm-* 2>/dev/null || true
