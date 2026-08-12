@@ -142,7 +142,7 @@ jobs:
           import json, sys
           d = json.load(open(sys.argv[1]))
           for a in d['assets']:
-              if a['name'].endswith('macOS_arm64.tar.gz'):
+              if a['name'].startswith('ipsw_') and a['name'].endswith('macOS_arm64.tar.gz'):
                   print(a['name'])
                   sys.exit(0)
           sys.exit(1)
@@ -166,6 +166,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          ipsw_url="https://updates.cdn-apple.com/2026SpringSeed/fullrestores/140-57232/9C526F0C-7857-4948-A10E-8D6791C27E01/iPhone18,1_27.0_24A5390f_Restore.ipsw"
           : > "$RUNNER_TEMP/analysis/binaries.txt"
           : > "$RUNNER_TEMP/analysis/missing.txt"
           : > "$RUNNER_TEMP/analysis/extract.log"
@@ -228,6 +229,26 @@ jobs:
               -print >> "$RUNNER_TEMP/analysis/extract.log" || true
             find "$RUNNER_TEMP/extracted" -type f -size +100k \
               -exec sh -c 'file "$1"' _ {} \; >> "$RUNNER_TEMP/analysis/extract.log" || true
+          fi
+          if command -v ipsw >/dev/null 2>&1 && [ -s "$RUNNER_TEMP/analysis/missing.txt" ]; then
+            cp "$RUNNER_TEMP/analysis/missing.txt" "$RUNNER_TEMP/analysis/missing.bak"
+            echo "--- remote extracting missing dylibs from exact 24A5390f IPSW ---"
+            ipsw extract --remote --files \
+              --pattern '.*/(GenerativeModels|AssistantServices|SiriAvailability|SiriActivationFoundation)\.framework/[^/]+$' \
+              "$ipsw_url" -o "$RUNNER_TEMP/extracted" \
+              >> "$RUNNER_TEMP/analysis/extract.log" 2>&1 || true
+            find "$RUNNER_TEMP/extracted" -type f -size +100k \
+              -exec sh -c 'file "$1"' _ {} \; >> "$RUNNER_TEMP/analysis/extract.log" || true
+            : > "$RUNNER_TEMP/analysis/missing.txt"
+            while IFS= read -r rel; do
+              name="$(basename "$rel")"
+              found="$(find "$RUNNER_TEMP/extracted" -type f -name "$name" | head -1)"
+              if [ -n "$found" ]; then
+                echo "$found" >> "$RUNNER_TEMP/analysis/binaries.txt"
+              else
+                echo "$rel" >> "$RUNNER_TEMP/analysis/missing.txt"
+              fi
+            done < "$RUNNER_TEMP/analysis/missing.bak"
           fi
           echo "--- extraction log ---"
           cat "$RUNNER_TEMP/analysis/extract.log" || true
