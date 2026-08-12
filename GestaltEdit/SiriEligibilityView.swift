@@ -9,17 +9,14 @@ struct SiriEligibilityView: View {
             Group {
                 if let snapshot {
                     List {
-                        fileAccessSection(snapshot)
+                        apiCapabilitySection(snapshot)
                         siriModeSection(snapshot)
                         relatedDomainsSection(snapshot)
-
-                        ForEach(snapshot.sections) { section in
-                            domainSection(section)
-                            rawSection(section)
-                        }
+                        allAnswersSection(snapshot)
+                        rawResponseSection(snapshot)
                     }
                 } else if isLoading {
-                    ProgressView("正在读取 eligibility…")
+                    ProgressView("正在通过 libsystem_eligibility 查询…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ContentUnavailableView(
@@ -52,36 +49,33 @@ struct SiriEligibilityView: View {
         isLoading = false
     }
 
-    private func fileAccessSection(_ snapshot: SiriEligibilitySnapshot) -> some View {
-        Section("文件可访问性") {
-            ForEach(snapshot.sections) { section in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text(section.file.path)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                        Spacer()
-                        Text(section.file.accessible ? "可读取" : "不可读取")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(section.file.accessible ? .green : .red)
-                    }
-                    if let parseError = section.parseError {
-                        Text(parseError)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } else if let error = section.file.error {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .textSelection(.enabled)
-                    } else {
-                        Text("\(section.domains.count) 个 domain")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+    private func apiCapabilitySection(_ snapshot: SiriEligibilitySnapshot) -> some View {
+        Section("libsystem_eligibility API") {
+            LabeledContent("状态") {
+                Text(snapshot.capability.loaded ? "可用" : "不可用")
+                    .fontWeight(.semibold)
+                    .foregroundStyle(snapshot.capability.loaded ? .green : .red)
+            }
+            LabeledContent("库路径") {
+                Text(snapshot.capability.libraryPath)
+                    .font(.caption2.monospaced())
+                    .textSelection(.enabled)
+            }
+
+            if !snapshot.capability.missingSymbols.isEmpty {
+                LabeledContent("缺失符号") {
+                    Text(snapshot.capability.missingSymbols.joined(separator: "\n"))
+                        .font(.caption2.monospaced())
+                        .multilineTextAlignment(.trailing)
+                        .textSelection(.enabled)
                 }
+            }
+
+            if let loadError = snapshot.capability.loadError, !loadError.isEmpty {
+                Text(loadError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
             }
         }
     }
@@ -91,38 +85,24 @@ struct SiriEligibilityView: View {
         Section("OS_ELIGIBILITY_DOMAIN_SIRI_MODE") {
             if let siriMode = snapshot.siriMode {
                 EligibilityDomainRowView(domain: siriMode)
-            } else if let parseError = snapshot.primarySection?.parseError {
-                Label("主 eligibility 文件无法解析", systemImage: "xmark.octagon")
-                Text(parseError)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            } else if let error = snapshot.primarySection?.file.error {
-                Label("主 eligibility 文件不可读取", systemImage: "xmark.octagon")
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .textSelection(.enabled)
+            } else if !snapshot.capability.loaded {
+                Label("libsystem_eligibility API 不可用", systemImage: "xmark.octagon")
+            } else if !snapshot.allAnswers.success {
+                Label("get_all_domain_answers 失败", systemImage: "exclamationmark.triangle")
             } else {
                 Label("未找到该 domain", systemImage: "questionmark.circle")
-                Text("文件可读取，但 plist 中没有 OS_ELIGIBILITY_DOMAIN_SIRI_MODE。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
         }
     }
 
     private func relatedDomainsSection(_ snapshot: SiriEligibilitySnapshot) -> some View {
         Section("相关 Siri AI / Apple Intelligence Domain") {
-            if snapshot.relatedDomains.isEmpty {
-                Label("未发现相关 domain", systemImage: "questionmark.circle")
-            } else {
-                ForEach(snapshot.relatedDomains) { domain in
-                    EligibilityDomainRowView(domain: domain)
-                }
+            ForEach(snapshot.relatedDomains) { domain in
+                EligibilityDomainRowView(domain: domain)
             }
 
             if !snapshot.missingRelatedDomains.isEmpty {
-                Text("未出现：\(snapshot.missingRelatedDomains.joined(separator: ", "))")
+                Text("get_all 未返回：\(snapshot.missingRelatedDomains.joined(separator: ", "))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
@@ -130,34 +110,45 @@ struct SiriEligibilityView: View {
         }
     }
 
-    private func domainSection(_ section: EligibilityFileSection) -> some View {
-        Section {
-            if section.domains.isEmpty {
-                Text(section.file.accessible ? "未解析到 domain" : "文件不可读取")
+    private func allAnswersSection(_ snapshot: SiriEligibilitySnapshot) -> some View {
+        Section("全部 Domain Answers") {
+            LabeledContent("调用结果") {
+                Text(snapshot.allAnswers.success ? "成功" : "失败")
+                    .foregroundStyle(snapshot.allAnswers.success ? .green : .red)
+            }
+            LabeledContent("errno") {
+                Text("\(snapshot.allAnswers.errnoValue)")
+                    .monospacedDigit()
+            }
+
+            if let error = snapshot.allAnswers.error, !error.isEmpty {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            }
+
+            if snapshot.allAnswers.success {
+                Text("\(snapshot.allDomains.count) 个 domain")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
-            } else {
-                ForEach(section.domains) { domain in
+
+                ForEach(snapshot.allDomains) { domain in
                     EligibilityDomainRowView(domain: domain)
                 }
             }
-        } header: {
-            Text(section.file.path)
-                .font(.caption)
         }
     }
 
-    @ViewBuilder
-    private func rawSection(_ section: EligibilityFileSection) -> some View {
-        if let rawText = section.rawText {
-            Section("原始文件内容") {
-                DisclosureGroup {
-                    Text(rawText)
-                        .font(.system(.caption2, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } label: {
-                    Label("显示原始 plist", systemImage: "doc.text.magnifyingglass")
-                }
+    private func rawResponseSection(_ snapshot: SiriEligibilitySnapshot) -> some View {
+        Section("API 原始返回") {
+            DisclosureGroup {
+                Text(EligibilityPlistText.xml(snapshot.allAnswers.rawDictionary))
+                    .font(.system(.caption2, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } label: {
+                Label("显示 get_all_domain_answers 原始结果", systemImage: "doc.text.magnifyingglass")
             }
         }
     }
@@ -188,6 +179,19 @@ private struct EligibilityDomainRowView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
+            if let apiErrno = domain.apiErrno {
+                LabeledContent("API errno") {
+                    Text("\(apiErrno)")
+                        .monospacedDigit()
+                }
+            }
+            if let apiError = domain.apiError, !apiError.isEmpty {
+                Text(apiError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            }
+
             if !domain.statusRows.isEmpty {
                 LabeledContent("status") {
                     Text("\(domain.statusRows.count) 项")
@@ -205,6 +209,17 @@ private struct EligibilityDomainRowView: View {
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.trailing)
                     }
+                }
+            }
+
+            if let context = domain.context, !context.isEmpty {
+                DisclosureGroup {
+                    Text(EligibilityPlistText.xml(context))
+                        .font(.system(.caption2, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } label: {
+                    Label("context", systemImage: "square.stack.3d.up")
                 }
             }
 

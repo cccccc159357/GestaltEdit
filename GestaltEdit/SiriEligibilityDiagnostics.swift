@@ -9,13 +9,18 @@ enum SiriEligibilityDomainKey {
     static let siriWithAppIntents = "OS_ELIGIBILITY_DOMAIN_SIRI_WITH_APP_INTENTS"
 }
 
-struct EligibilityFileResult: Identifiable {
-    let path: String
-    let data: Data?
-    let error: String?
+struct EligibilityAPISummary {
+    let loaded: Bool
+    let libraryPath: String
+    let loadError: String?
+    let missingSymbols: [String]
+}
 
-    var id: String { path }
-    var accessible: Bool { data != nil }
+struct EligibilityAPIResponse {
+    let success: Bool
+    let errnoValue: Int
+    let error: String?
+    let rawDictionary: [String: Any]
 }
 
 struct EligibilityStatusRow: Identifiable {
@@ -30,28 +35,22 @@ struct EligibilityDomainResult: Identifiable {
     let answer: Int64?
     let answerSource: Int64?
     let statusRows: [EligibilityStatusRow]
+    let context: [String: Any]?
+    let apiErrno: Int?
+    let apiError: String?
     let rawDictionary: [String: Any]
 
     var id: String { key }
     var rawText: String { EligibilityPlistText.xml(rawDictionary) }
 }
 
-struct EligibilityFileSection: Identifiable {
-    let file: EligibilityFileResult
-    let domains: [EligibilityDomainResult]
-    let rawText: String?
-    let parseError: String?
-
-    var id: String { file.id }
-}
-
 struct SiriEligibilitySnapshot {
-    let sections: [EligibilityFileSection]
+    let capability: EligibilityAPISummary
+    let allAnswers: EligibilityAPIResponse
+    let allDomains: [EligibilityDomainResult]
     let siriMode: EligibilityDomainResult?
     let relatedDomains: [EligibilityDomainResult]
     let missingRelatedDomains: [String]
-
-    var primarySection: EligibilityFileSection? { sections.first }
 }
 
 enum EligibilityPlistText {
@@ -106,11 +105,6 @@ enum EligibilityAnswerText {
 }
 
 enum SiriEligibilityDiagnostics {
-    static let primaryPath = "/private/var/db/os_eligibility/eligibility.plist"
-    static let additionalPaths = [
-        "/private/var/db/eligibilityd/eligibility.plist",
-        "/private/var/db/eligibilityd/eligibility_inputs.plist"
-    ]
     static let relatedDomainKeys = [
         SiriEligibilityDomainKey.siriMode,
         SiriEligibilityDomainKey.siriModeNeedsConsent,
@@ -121,76 +115,100 @@ enum SiriEligibilityDiagnostics {
     ]
 
     static func load() -> SiriEligibilitySnapshot {
-        let sections = ([primaryPath] + additionalPaths).map { path in
-            let file = readFile(at: path)
-            let dictionary = file.data.flatMap(parsePlist)
-            let parseError = file.data != nil && dictionary == nil
-                ? "文件可读取，但无法解析为 plist。"
-                : nil
-            return EligibilityFileSection(
-                file: file,
-                domains: domains(in: dictionary),
-                rawText: dictionary.map(EligibilityPlistText.xml),
-                parseError: parseError
-            )
-        }
-
-        let primaryDomains = sections.first?.domains ?? []
-        let domainsByKey = Dictionary(
-            primaryDomains.map { ($0.key, $0) },
-            uniquingKeysWith: { first, _ in first }
+        let capability = parseCapability(
+            EligibilityAPICapability() as? [String: Any] ?? [:]
         )
-        let presentRelated = relatedDomainKeys.compactMap { domainsByKey[$0] }
-        let presentKeys = Set(presentRelated.map(\.key))
+        let allResponse = parseAllAnswers(
+            EligibilityQueryAllAnswers() as? [String: Any] ?? [:]
+        )
+        let allDomains = allDomains(from: allResponse.rawDictionary)
+        let relatedDomains = relatedDomainKeys.map(domainDetail)
+        let siriMode = relatedDomains.first {
+            $0.key == SiriEligibilityDomainKey.siriMode
+        }
+        let presentKeys = Set(allResponse.rawDictionary.keys)
         let missing = relatedDomainKeys.filter { !presentKeys.contains($0) }
 
         return SiriEligibilitySnapshot(
-            sections: sections,
-            siriMode: domainsByKey[SiriEligibilityDomainKey.siriMode],
-            relatedDomains: presentRelated,
+            capability: capability,
+            allAnswers: allResponse,
+            allDomains: allDomains,
+            siriMode: siriMode,
+            relatedDomains: relatedDomains,
             missingRelatedDomains: missing
         )
     }
 
-    private static func readFile(at path: String) -> EligibilityFileResult {
-        var error: NSError?
-        guard let data = EligibilityReadFile(path, &error) else {
-            return EligibilityFileResult(
-                path: path,
-                data: nil,
-                error: error?.localizedDescription ?? "未知错误"
-            )
-        }
-        return EligibilityFileResult(path: path, data: data, error: nil)
+    private static func parseCapability(_ dictionary: [String: Any]) -> EligibilityAPISummary {
+        EligibilityAPISummary(
+            loaded: (dictionary["loaded"] as? NSNumber)?.boolValue ?? false,
+            libraryPath: dictionary["libraryPath"] as? String ?? "",
+            loadError: dictionary["loadError"] as? String,
+            missingSymbols: dictionary["missingSymbols"] as? [String] ?? []
+        )
     }
 
-    private static func parsePlist(_ data: Data) -> [String: Any]? {
-        var format = PropertyListSerialization.PropertyListFormat.binary
-        guard let object = try? PropertyListSerialization.propertyList(
-            from: data,
-            options: [],
-            format: &format
-        ), let dictionary = object as? [String: Any] else {
-            return nil
-        }
-        return dictionary
+    private static func parseAllAnswers(_ dictionary: [String: Any]) -> EligibilityAPIResponse {
+        EligibilityAPIResponse(
+            success: (dictionary["success"] as? NSNumber)?.boolValue ?? false,
+            errnoValue: (dictionary["errno"] as? NSNumber)?.intValue ?? -1,
+            error: dictionary["error"] as? String,
+            rawDictionary: dictionary["raw"] as? [String: Any] ?? [:]
+        )
     }
 
-    private static func domains(in dictionary: [String: Any]?) -> [EligibilityDomainResult] {
-        guard let dictionary else { return [] }
-        return dictionary.keys.sorted().compactMap { key in
-            guard let value = dictionary[key] as? [String: Any] else { return nil }
-            let status = value["status"] as? [String: Any] ?? [:]
+    private static func allDomains(from raw: [String: Any]) -> [EligibilityDomainResult] {
+        raw.keys.sorted().map { key in
+            let value = raw[key] ?? NSNull()
+            if let dictionary = value as? [String: Any] {
+                let status = dictionary["status"] as? [String: Any] ?? [:]
+                return EligibilityDomainResult(
+                    key: key,
+                    answer: integer(dictionary["os_eligibility_answer_t"]),
+                    answerSource: integer(dictionary["os_eligibility_answer_source_t"]),
+                    statusRows: statusRows(status),
+                    context: dictionary["context"] as? [String: Any],
+                    apiErrno: nil,
+                    apiError: nil,
+                    rawDictionary: dictionary
+                )
+            }
+            let answer = (value as? NSNumber)?.int64Value
             return EligibilityDomainResult(
                 key: key,
-                answer: integer(value["os_eligibility_answer_t"]),
-                answerSource: integer(value["os_eligibility_answer_source_t"]),
-                statusRows: status.keys.sorted().compactMap { statusKey in
-                    guard let statusValue = integer(status[statusKey]) else { return nil }
-                    return EligibilityStatusRow(key: statusKey, value: statusValue)
-                },
-                rawDictionary: value
+                answer: answer,
+                answerSource: nil,
+                statusRows: [],
+                context: nil,
+                apiErrno: nil,
+                apiError: nil,
+                rawDictionary: [key: value]
             )
+        }
+    }
+
+    private static func domainDetail(_ key: String) -> EligibilityDomainResult {
+        let detail = EligibilityQueryDomainAnswer(key) as? [String: Any] ?? [:]
+        let raw = detail["raw"] as? [String: Any] ?? detail
+        let status = detail["status"] as? [String: Any] ?? [:]
+        let errnoValue = (detail["errno"] as? NSNumber)?.intValue
+
+        return EligibilityDomainResult(
+            key: key,
+            answer: integer(detail["answer"]),
+            answerSource: integer(detail["answer_source"]),
+            statusRows: statusRows(status),
+            context: detail["context"] as? [String: Any],
+            apiErrno: errnoValue,
+            apiError: detail["error"] as? String,
+            rawDictionary: raw
+        )
+    }
+
+    private static func statusRows(_ status: [String: Any]) -> [EligibilityStatusRow] {
+        status.keys.sorted().compactMap { key in
+            guard let value = integer(status[key]) else { return nil }
+            return EligibilityStatusRow(key: key, value: value)
         }
     }
 

@@ -4,3 +4,4 @@
 
 #import "GestaltAccess.h"
 #import "EligibilityFileAccess.h"
+#import "EligibilityAPI.h"
