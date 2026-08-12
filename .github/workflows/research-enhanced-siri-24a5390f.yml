@@ -257,7 +257,10 @@ jobs:
             ipsw extract --remote --dyld --dyld-arch arm64e \
               "$ipsw_url" -o "$RUNNER_TEMP/dyld" \
               >> "$RUNNER_TEMP/analysis/extract.log" 2>&1 || true
-            cache="$(find "$RUNNER_TEMP/dyld" -type f -name 'dyld_shared_cache*' | head -1)"
+            cache="$(find "$RUNNER_TEMP/dyld" -type f -name 'dyld_shared_cache_arm64e' | head -1)"
+            if [ -z "$cache" ]; then
+              cache="$(find "$RUNNER_TEMP/dyld" -type f -name 'dyld_shared_cache*' ! -name '*.atlas' ! -name '*.symbols' | head -1)"
+            fi
             echo "dyld cache: $cache" >> "$RUNNER_TEMP/analysis/extract.log"
             if [ -n "$cache" ]; then
               while IFS= read -r rel; do
@@ -265,7 +268,7 @@ jobs:
                 mkdir -p "$RUNNER_TEMP/extracted/$name"
                 (
                   cd "$RUNNER_TEMP/extracted/$name"
-                  ipsw dyld extract "$cache" --dylib "$name" -o "$RUNNER_TEMP/extracted/$name" \
+                  ipsw dyld extract "$cache" "$name" -o "$RUNNER_TEMP/extracted/$name" \
                     >> "$RUNNER_TEMP/analysis/extract.log" 2>&1 || true
                 )
               done < "$RUNNER_TEMP/analysis/missing.bak"
@@ -329,12 +332,8 @@ jobs:
                 ipsw macho disass "$bin" --symbol "$sym" \
                   >> "$RUNNER_TEMP/analysis/disasm-$name.txt" 2>&1 || true
               done < "$RUNNER_TEMP/analysis/funcs-$name.txt"
-              ipsw macho search "$bin" --sym "UnifiedReason|UnavailableReason|pendingEnrollment|essentialAssetReadiness" \
-                > "$RUNNER_TEMP/analysis/ipsw-search-reasons-$name.txt" 2>&1 || true
-              ipsw macho search "$bin" --sym "HasLinwood|SiriMode|LinwoodAvailability" \
-                > "$RUNNER_TEMP/analysis/ipsw-search-unknownreason-$name.txt" 2>&1 || true
-              ipsw macho search "$bin" --sym "EnhancedSiri|Linwood" \
-                > "$RUNNER_TEMP/analysis/ipsw-search-waitlist-$name.txt" 2>&1 || true
+              ipsw macho info "$bin" \
+                > "$RUNNER_TEMP/analysis/ipsw-info-$name.txt" 2>&1 || true
             else
               while IFS= read -r sym; do
                 for cand in "$sym" "${sym#_}"; do
@@ -385,8 +384,8 @@ jobs:
             echo "## Key symbols"
             head -250 "$RUNNER_TEMP/analysis"/symbols-* 2>/dev/null || true
             echo ""
-            echo "## ipsw searches"
-            head -200 "$RUNNER_TEMP/analysis"/ipsw-search-* 2>/dev/null || true
+            echo "## ipsw info"
+            head -100 "$RUNNER_TEMP/analysis"/ipsw-info-* 2>/dev/null || true
             echo ""
             echo "## Disassembly"
             head -500 "$RUNNER_TEMP/analysis"/disasm-* 2>/dev/null || true
