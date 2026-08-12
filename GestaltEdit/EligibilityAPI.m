@@ -142,7 +142,6 @@ NSDictionary *EligibilityQueryAllAnswers(void)
     int result = gGetAllAnswers(&answers);
     BOOL hasAnswers = answers != NULL;
     NSDictionary *raw = hasAnswers ? EligibilityXPCToFoundation(answers) : @{};
-    if (hasAnswers) xpc_release(answers);
 
     return @{
         @"success": @(result == 0 && hasAnswers),
@@ -185,8 +184,6 @@ NSDictionary *EligibilityQueryDomainAnswer(NSString *domainName)
 
     NSDictionary *statusDict = status ? EligibilityXPCToFoundation(status) : @{};
     NSDictionary *contextDict = context ? EligibilityXPCToFoundation(context) : @{};
-    if (status) xpc_release(status);
-    if (context) xpc_release(context);
 
     NSMutableDictionary *raw = [NSMutableDictionary dictionary];
     raw[@"domain"] = domainName ?: @"";
