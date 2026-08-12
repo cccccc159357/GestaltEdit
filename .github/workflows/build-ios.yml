@@ -57,6 +57,9 @@ jobs:
           # .xcodeproj, which is just Xcode's own project.xcworkspace.
           workspace="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -name "*.xcworkspace" \
             ! -path "*/.xcodeproj/*" -print -quit || true)"
+          if [[ "$workspace" == *".xcodeproj/"* ]]; then
+            workspace=""
+          fi
           project="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -name "*.xcodeproj" \
             -print -quit || true)"
 
@@ -74,7 +77,7 @@ jobs:
           fi
 
           scheme="$(printf '%s' "$list_output" | python3 -c \
-            'import json,sys; d=json.load(sys.stdin); print((d.get("schemes") or [""])[0])')"
+            'import json,sys; d=json.load(sys.stdin); c=d.get("workspace") or d.get("project") or {}; print((c.get("schemes") or [""])[0])')"
           if [ -z "$scheme" ]; then
             echo "::error::xcodebuild did not report a scheme."
             printf '%s\n' "$list_output"
